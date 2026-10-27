@@ -1,8 +1,44 @@
-from typing import Literal, Optional, Any, Annotated
+from typing import Literal, Optional, Any, Annotated, List
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
+
+# ════════════════════════════════════════════════════════════════
+# A. 通用工單資料模型 (Ticket Subsystem ⇄ Supervisor ⇄ Subgraphs)
+# ════════════════════════════════════════════════════════════════
+
+# 工單類型列舉 (為未來彈性預留)
+TicketType = Literal[
+    "CREATE_VM",          # 建立虛擬機
+    "EXPAND_RESOURCE",    # 資源擴容 (未來)
+    "DECOMMISSION_VM",    # 註銷/下線虛擬機 (未來)
+    "NETWORK_ADJUSTMENT", # 網路變更 (未來)
+    "UNKNOWN"             # 未知/人工處理
+]
+
+
+class ParsedTicket(BaseModel):
+    """統一工單封裝模型 (Ollama 解析產出)"""
+    ticket_id: str = Field(description="工單單號，如 SRA26100500001")
+    applicant: str = Field(description="申請人姓名/工號")
+    department: str = Field(description="申請人部門單位")
+    ticket_type: TicketType = Field(description="識別出的工單類型")
+    summary: str = Field(description="工單需求摘要說明")
+    approval_notes: Optional[str] = Field(default="", description="簽核審批意見")
+
+    # 根據不同 ticket_type 存放具體的負載陣列
+    # 例如 CREATE_VM 時，items 存放各台機器的描述文字或規格字典
+    action_items: List[dict[str, Any]] = Field(
+        default_factory=list,
+        description="拆解出的具體動作清單 (每筆項目可獨立交由對應 Subgraph 處理)"
+    )
+    raw_content: Optional[str] = Field(default="", description="原始工單文本")
+
+
+# ════════════════════════════════════════════════════════════════
+# B. VM Provisioning 子圖資料模型
+# ════════════════════════════════════════════════════════════════
 
 # 1. 完整的 VM 建立必要參數模型
 class VMDeploymentParams(BaseModel):

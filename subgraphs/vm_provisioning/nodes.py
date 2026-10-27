@@ -1,37 +1,51 @@
-import os
+"""VM Provisioning 子圖節點 (原 agent.py 遷移)
+
+節點：analyze_and_extract → check_completeness → (ask_clarification | human_review) → submit_request
+"""
 import time
-import tomllib
-from typing import Any, Optional
-from dotenv import load_dotenv
+from typing import Any
 
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.types import interrupt, Command
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langgraph.graph import END
+from langgraph.types import interrupt
 
-from schemas import (
-    VMDeploymentParams,
-    SpecExtractionResult,
-    AgentState
-)
-from tools import aria_client
+import config
+from clients.aria_client import aria_client
+from clients.llm import get_llm
+from schemas import VMDeploymentParams, SpecExtractionResult, AgentState
 
-# 載入設定與 Prompts
-load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+PROMPTS = config.PROMPTS
 
-PROMPTS_PATH = os.path.join(os.path.dirname(__file__), "prompts.toml")
-with open(PROMPTS_PATH, "rb") as f:
-    PROMPTS = tomllib.load(f)
+# 16 個必填欄位
+REQUIRED_FIELDS = [
+    "deployment_name", "blueprint_id", "project_id", "cpu_count",
+    "memory_size", "os_image", "sg", "network_segment", "ip_mode",
+    "cluster", "datastore", "case_no", "ap_owner", "os_owner",
+    "ap_unit", "description"
+]
 
-# 初始化 Gemini LLM
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+# 核心不可缺少的關鍵欄位：專案、藍圖/OS、CPU、記憶體、單號、負責人
+CRITICAL_FIELDS = ["project_id", "blueprint_id", "cpu_count", "memory_size", "case_no", "ap_owner"]
 
-llm = ChatGoogleGenerativeAI(
-    model=MODEL_NAME,
-    google_api_key=GOOGLE_API_KEY
-)
+FIELD_LABELS = {
+    "project_id": "Aria 專案名稱 (如 hqit-HCMBI)",
+    "blueprint_id": "藍圖範本 (如 Windows, Ubuntu, Debian)",
+    "os_image": "作業系統版本 / 映像檔 (如 Windows Server 2022, Ubuntu 22.04)",
+    "cpu_count": "CPU 核心數 (例如: 4)",
+    "memory_size": "記憶體容量 GB (例如: 16)",
+    "case_no": "需求單號 (如 C25033100002)",
+    "ap_owner": "AP 負責人姓名",
+    "os_owner": "OS 負責人姓名",
+    "ap_unit": "應用單位",
+    "description": "用途說明",
+    "deployment_name": "部署名稱",
+    "sg": "NSX-T 安全群組 (如 APP, WEB, DB)",
+    "network_segment": "網段 (如 VLAN100)",
+    "ip_mode": "IP 模式 (DHCP 或 STATIC)",
+    "cluster": "運算集群 (如 Cluster-01)",
+    "datastore": "存儲空間 (如 Datastore-01)"
+}
+
 
 # 1. 意圖分析與規格抽取節點
 def analyze_and_extract(state: AgentState) -> dict[str, Any]:
@@ -42,21 +56,21 @@ def analyze_and_extract(state: AgentState) -> dict[str, Any]:
     # 取得系統中所有可用的 OS Image 映射清單 (來自 /iaas/api/image-profiles)
     try:
         available_images = aria_client.get_os_images()
-    except Exception as e:
+    except Exception:
         available_images = {}
 
     image_keys_str = ", ".join(available_images.keys()) if available_images else "無"
 
     system_instruction = (
-        f"{PROMPTS['agent']['system']}\n\n"
-        f"{PROMPTS['extraction']['system']}\n\n"
+        f"{PROMPTS['vm_agent']['system']}\n\n"
+        f"{PROMPTS['extractor']['system']}\n\n"
         f"【系統目前支援的 OS Image 映像檔名稱清單 (image-profiles)】:\n{image_keys_str}\n\n"
         f"注意：os_image 必須為上述清單中的具體名稱。\n\n"
         f"目前已知/已累積的規格參數: {current_spec}"
     )
 
-    structured_llm = llm.with_structured_output(SpecExtractionResult)
-    
+    structured_llm = get_llm().with_structured_output(SpecExtractionResult)
+
     # 組合對話歷史傳給模型
     prompt_messages = [SystemMessage(content=system_instruction)] + messages
     result: SpecExtractionResult = structured_llm.invoke(prompt_messages)
@@ -72,8 +86,7 @@ def analyze_and_extract(state: AgentState) -> dict[str, Any]:
             matched_proj = projects[0]
             current_spec["project_id"] = matched_proj["id"]
             current_spec["project_name"] = matched_proj["name"]
-            proj_name = matched_proj["name"]
-            
+
             # 嘗試從專案 description (例如 'C25033100002/王興勝/HCM BI Dashboard') 自動輔助填補
             desc = matched_proj.get("description", "")
             parts = desc.split("/")
@@ -162,24 +175,15 @@ def analyze_and_extract(state: AgentState) -> dict[str, Any]:
 def check_completeness(state: AgentState) -> dict[str, Any]:
     """檢查 16 個必填欄位是否完整"""
     current_spec = state.get("current_spec") or {}
-    
-    required_fields = [
-        "deployment_name", "blueprint_id", "project_id", "cpu_count",
-        "memory_size", "os_image", "sg", "network_segment", "ip_mode",
-        "cluster", "datastore", "case_no", "ap_owner", "os_owner",
-        "ap_unit", "description"
-    ]
-    
-    missing = [f for f in required_fields if not current_spec.get(f)]
+    missing = [f for f in REQUIRED_FIELDS if not current_spec.get(f)]
     return {"missing_fields": missing}
 
 
 def route_completeness(state: AgentState) -> str:
     """若有核心欄位缺失則發問，齊全則進入人工審查"""
     missing = state.get("missing_fields", [])
-    # 核心不可缺少的關鍵欄位：專案、藍圖/OS、CPU、記憶體、單號、負責人
-    critical_missing = [f for f in missing if f in ["project_id", "blueprint_id", "cpu_count", "memory_size", "case_no", "ap_owner"]]
-    
+    critical_missing = [f for f in missing if f in CRITICAL_FIELDS]
+
     if critical_missing:
         return "ask_clarification"
     return "human_review"
@@ -189,29 +193,10 @@ def route_completeness(state: AgentState) -> str:
 def ask_clarification(state: AgentState) -> dict[str, Any]:
     """向使用者詢問缺少的必要資訊"""
     missing = state.get("missing_fields", [])
-    
-    field_labels = {
-        "project_id": "Aria 專案名稱 (如 hqit-HCMBI)",
-        "blueprint_id": "藍圖範本 (如 Windows, Ubuntu, Debian)",
-        "os_image": "作業系統版本 / 映像檔 (如 Windows Server 2022, Ubuntu 22.04)",
-        "cpu_count": "CPU 核心數 (例如: 4)",
-        "memory_size": "記憶體容量 GB (例如: 16)",
-        "case_no": "需求單號 (如 C25033100002)",
-        "ap_owner": "AP 負責人姓名",
-        "os_owner": "OS 負責人姓名",
-        "ap_unit": "應用單位",
-        "description": "用途說明",
-        "deployment_name": "部署名稱",
-        "sg": "NSX-T 安全群組 (如 APP, WEB, DB)",
-        "network_segment": "網段 (如 VLAN100)",
-        "ip_mode": "IP 模式 (DHCP 或 STATIC)",
-        "cluster": "運算集群 (如 Cluster-01)",
-        "datastore": "存儲空間 (如 Datastore-01)"
-    }
 
-    missing_labels = [f"- {field_labels.get(f, f)}" for f in missing]
+    missing_labels = [f"- {FIELD_LABELS.get(f, f)}" for f in missing]
     missing_text = "\n".join(missing_labels)
-    msg = PROMPTS["clarification"]["prompt"].format(missing_fields_text=missing_text)
+    msg = PROMPTS["clarification"]["reply"].format(missing_fields_text=missing_text)
 
     return {
         "messages": [AIMessage(content=msg)]
@@ -220,7 +205,7 @@ def ask_clarification(state: AgentState) -> dict[str, Any]:
 
 # 4. 人工審核中斷節點 (HITL)
 def human_review(state: AgentState) -> dict[str, Any]:
-    """觸發中斷等待人工審查，支援核准、修改參數或退回"""
+    """觸發中斷等待人工審查，支援核准、修改參數、退回或取消"""
     spec = dict(state.get("current_spec") or {})
 
     # 確保 project_name 與 blueprint_name 已解析填補以供檢視辨識
@@ -238,6 +223,7 @@ def human_review(state: AgentState) -> dict[str, Any]:
 
     # 外部呼叫 Command(resume=payload) 恢復執行時，human_response 即為傳入的 payload
     approved = human_response.get("approved", False)
+    aborted = human_response.get("aborted", False)
     updated_params = human_response.get("updated_params") or {}
     user_feedback = human_response.get("user_feedback")
 
@@ -264,14 +250,21 @@ def human_review(state: AgentState) -> dict[str, Any]:
             "current_spec": new_spec,
             "human_feedback": human_response
         }
-    else:
+    if aborted:
+        # 使用者放棄本台 VM，直接結束子圖 (不再回到 analyze 重新推論)
         return {
             "current_spec": new_spec,
             "human_feedback": human_response,
-            "messages": [
-                HumanMessage(content=f"人工審查已退回，意見為: {user_feedback or '請調整規格'}")
-            ]
+            "execution_result": {"aborted": True, "reason": user_feedback or "使用者於人工審查取消"},
+            "messages": [AIMessage(content=f"🚫 已取消此 VM 部署。{('原因: ' + user_feedback) if user_feedback else ''}")]
         }
+    return {
+        "current_spec": new_spec,
+        "human_feedback": human_response,
+        "messages": [
+            HumanMessage(content=f"人工審查已退回，意見為: {user_feedback or '請調整規格'}")
+        ]
+    }
 
 
 def route_review_result(state: AgentState) -> str:
@@ -279,6 +272,8 @@ def route_review_result(state: AgentState) -> str:
     fb = state.get("human_feedback") or {}
     if fb.get("approved"):
         return "submit_request"
+    if fb.get("aborted"):
+        return END
     return "analyze_and_extract"
 
 
@@ -314,49 +309,3 @@ def submit_request(state: AgentState) -> dict[str, Any]:
             "execution_result": {"error": str(e)},
             "messages": [AIMessage(content=err_msg)]
         }
-
-
-# 建立 LangGraph 工作流
-def build_agent_graph():
-    builder = StateGraph(AgentState)
-
-    # 加入節點
-    builder.add_node("analyze_and_extract", analyze_and_extract)
-    builder.add_node("check_completeness", check_completeness)
-    builder.add_node("ask_clarification", ask_clarification)
-    builder.add_node("human_review", human_review)
-    builder.add_node("submit_request", submit_request)
-
-    # 加入邊
-    builder.add_edge(START, "analyze_and_extract")
-    builder.add_edge("analyze_and_extract", "check_completeness")
-    
-    # 條件邊：檢查參數完整性
-    builder.add_conditional_edges(
-        "check_completeness",
-        route_completeness,
-        {
-            "ask_clarification": "ask_clarification",
-            "human_review": "human_review"
-        }
-    )
-
-    # 若缺少參數發問後即結束本輪，等待使用者補充
-    builder.add_edge("ask_clarification", END)
-
-    # 條件邊：人工審核結果
-    builder.add_conditional_edges(
-        "human_review",
-        route_review_result,
-        {
-            "submit_request": "submit_request",
-            "analyze_and_extract": "analyze_and_extract"
-        }
-    )
-
-    # 提交完成結束
-    builder.add_edge("submit_request", END)
-
-    # 搭配 MemorySaver 支援狀態保留與中斷恢復
-    checkpointer = MemorySaver()
-    return builder.compile(checkpointer=checkpointer)
